@@ -1,0 +1,116 @@
+name: Deployment - Reusable Workflow
+on:
+    workflow_call: 
+      
+      inputs:
+        mongodb-uri:
+          required: true
+          type: string
+        k8s-manifest-uri:
+          description: Directory containing Kubernetes manifest files
+          default: kubernetes/
+          required: true
+          type: string
+        kubectl-version:
+          description: Provide the required kubectl version
+          default: v1.33.0
+          required: false
+          type: string
+        environment:
+          description: Provide the Deployment Environment
+          default: dev
+          required: true
+          type: string
+      secrets:
+        gcp-auth:
+          required: true
+        k8s-kubeconfig: 
+          required: true
+        mongodb-password:
+          required: true
+      outputs:
+        application-uri:
+          value: ${{jobs.reuse-deploy.outputs.APP_INGRESS_URL}}
+jobs:
+   reuse-deploy:
+    environment: 
+      name: ${{inputs.environment}}
+      url: https://${{steps.set-ingress-host-address.outputs.APP_INGRESS_HOST}}
+    outputs:
+      APP_INGRESS_URL: ${{steps.set-ingress-host-address.outputs.APP_INGRESS_HOST}}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@v4
+
+      - name: Install kubectl CLI
+        uses: azure/setup-kubectl@v4
+        with: 
+          version: ${{inputs.kubectl-version}}
+      
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: '${{ secrets.gcp-auth }}'
+
+
+      - name: Set Kubeconfig file
+        uses: azure/k8s-set-context@v4
+        with:
+          method: kubeconfig
+          kubeconfig: ${{secrets.k8s-kubeconfig}}
+
+      - name: Set up GKE credentials
+        uses: google-github-actions/get-gke-credentials@v2
+        with:
+          cluster_name: kkproject-cluster
+          location: us-central1
+
+      - name: Fetch K8s Cluster Details
+        run: |
+          kubectl version 
+          echo ---------------
+          kubectl get nodes
+      
+      - name: Save Nginx Ingress Controller IP as a GITHUB Environment
+        run: |
+         echo "INGRESS_IP=$(kubectl -n ingress-nginx get services ingress-nginx-controller -o jsonpath="{.status.loadBalancer.ingress[0].ip}")" >> $GITHUB_ENV
+
+      - name: Replace Token
+        uses: cschleiden/replace-tokens@v1
+        with:
+          tokenPrefix: '_{_'
+          tokenSuffix: '_}_'
+          files: '["${{inputs.k8s-manifest-uri}}*.yaml"]'
+        env:
+          NAMESPACE: ${{vars.NAMESPACE}}
+          REPLICAS: ${{vars.REPLICAS}}
+          IMAGE: ${{vars.DOCKER_USERNAME}}/solar-system:${{github.sha}}
+          INGRESS_IP: ${{env.INGRESS_IP}}
+
+      - name: Check files
+        run: |
+         cat ${{inputs.k8s-manifest-uri}}*.yaml
+
+      - name: Create namespace 
+        run: | 
+          kubectl get ns ${{vars.NAMESPACE}} || kubectl create ns ${{vars.NAMESPACE}}
+
+      - name: Create MongoDB Secret
+        run: |
+         kubectl create secret generic mongo-db-creds -n ${{vars.NAMESPACE}} \
+         --from-literal=MONGO_URI=${{inputs.mongodb-uri}} \
+         --from-literal=MONGO_USERNAME=${{vars.MONGO_USERNAME}} \
+         --from-literal=MONGO_PASSWORD=${{secrets.mongodb-password}} \
+         --dry-run=client --save-config \
+         -o yaml | kubectl apply -f -
+      
+      - name: Deploy to Dev Env
+        run: |
+          kubectl apply -f ${{inputs.k8s-manifest-uri}}
+        
+      - name: Set App Ingress Host URL
+        id: set-ingress-host-address
+        run: |
+         echo "APP_INGRESS_HOST=$(kubectl -n ${{vars.NAMESPACE}} get ingress -o jsonpath="{.items[0].spec.tls[0].hosts[0]}")" >> $GITHUB_OUTPUT
+

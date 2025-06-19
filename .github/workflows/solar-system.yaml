@@ -102,6 +102,37 @@ jobs:
             path: coverage
             retention-days: 5
 
+   reports-s3:
+    needs: [code-coverage, unit-testing]
+    name: AWS - S3 Upload Reports
+    strategy: 
+        matrix: 
+            nodejs_version: [ 18, 20 ]
+            operating_system: [ubuntu-latest]
+    runs-on: ${{matrix.operating_system}}
+    continue-on-error: true
+    steps:
+      - name: Download Test Artifact
+        uses: actions/download-artifact@v4
+        with: 
+          name: output-${{matrix.operating_system}}-${{matrix.nodejs_version}}
+      
+      - name: Download Code Coverage Artifact
+        uses: actions/download-artifact@v4
+        with: 
+          name: Code-Coverage-Result
+        
+      - name: Merge Test Files
+        run: | 
+          ls -ltr
+          mkdir reports-${{github.sha}}
+          mv cobertura-coverage.xml reports-${{github.sha}}/
+          mv test-results.xml reports-${{github.sha}}/
+          ls -ltr reports-${{github.sha}}/
+
+      - name: Upload to AWS S3
+        run: echo "Uploading....."
+  
    docker: 
     name: Containerization
     permissions: 
@@ -157,86 +188,16 @@ jobs:
    dev-deploy:
     needs: docker
     if: contains(github.ref, 'feature/')
-    environment: 
-      name: development
-      url: https://${{steps.set-ingress-host-address.outputs.APP_INGRESS_HOST}}
-    outputs:
-      APP_INGRESS_URL: ${{steps.set-ingress-host-address.outputs.APP_INGRESS_HOST}}
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout Repo
-        uses: actions/checkout@v4
-
-      - name: Install kubectl CLI
-        uses: azure/setup-kubectl@v4
-        with: 
-          version: 'v1.33.1'
-      
-      - name: Authenticate to Google Cloud
-        uses: google-github-actions/auth@v2
-        with:
-          credentials_json: '${{ secrets.GCP_SA_KEY }}'
-
-
-      - name: Set Kubeconfig file
-        uses: azure/k8s-set-context@v4
-        with:
-          method: kubeconfig
-          kubeconfig: ${{secrets.KUBECONFIG}}
-
-      - name: Set up GKE credentials
-        uses: google-github-actions/get-gke-credentials@v2
-        with:
-          cluster_name: kkproject-cluster
-          location: us-central1
-
-      - name: Fetch K8s Cluster Details
-        run: |
-          kubectl version 
-          echo ---------------
-          kubectl get nodes
-      
-      - name: Save Nginx Ingress Controller IP as a GITHUB Environment
-        run: |
-         echo "INGRESS_IP=$(kubectl -n ingress-nginx get services ingress-nginx-controller -o jsonpath="{.status.loadBalancer.ingress[0].ip}")" >> $GITHUB_ENV
-
-      - name: Replace Token
-        uses: cschleiden/replace-tokens@v1
-        with:
-          tokenPrefix: '_{_'
-          tokenSuffix: '_}_'
-          files: '["kubernetes/development/*.yaml"]'
-        env:
-          NAMESPACE: ${{vars.NAMESPACE}}
-          REPLICAS: ${{vars.REPLICAS}}
-          IMAGE: ${{vars.DOCKER_USERNAME}}/solar-system:${{github.sha}}
-          INGRESS_IP: ${{env.INGRESS_IP}}
-
-      - name: Check files
-        run: |
-         cat kubernetes/development/*.yaml
-
-      - name: Create namespace 
-        run: | 
-          kubectl get ns ${{vars.NAMESPACE}} || kubectl create ns ${{vars.NAMESPACE}}
-
-      - name: Create MongoDB Secret
-        run: |
-         kubectl create secret generic mongo-db-creds -n ${{vars.NAMESPACE}} \
-         --from-literal=MONGO_URI=${{env.MONGO_URI}} \
-         --from-literal=MONGO_USERNAME=${{vars.MONGO_USERNAME}} \
-         --from-literal=MONGO_PASSWORD=${{secrets.MONGO_PASSWORD}} \
-         --dry-run=client --save-config \
-         -o yaml | kubectl apply -f -
-      
-      - name: Deploy to Dev Env
-        run: |
-          kubectl apply -f kubernetes/development
-        
-      - name: Set App Ingress Host URL
-        id: set-ingress-host-address
-        run: |
-         echo "APP_INGRESS_HOST=$(kubectl -n ${{vars.NAMESPACE}} get ingress -o jsonpath="{.items[0].spec.tls[0].hosts[0]}")" >> $GITHUB_OUTPUT
+    uses: tobi-willy/solar-system/.github/workflows/reuse-deployment.yaml@feature/exploring-workflow
+    secrets:
+      gcp-auth: ${{secrets.GCP_SA_KEY}}
+      k8s-kubeconfig: ${{secrets.KUBECONFIG}}
+      mongodb-password: ${{ secrets.MONGO_PASSWORD}}
+    with:
+      mongodb-uri: ${{vars.MONGO_URI}}
+      environment: development
+      k8s-manifest-uri: kubernetes/development/
+ 
 
    dev-integration-testing:
       if: contains(github.ref, 'feature/')
@@ -246,7 +207,7 @@ jobs:
       steps:
         - name: Test URL output CURL and JQ
           env: 
-            URL: ${{needs.dev-deploy.outputs.APP_INGRESS_URL}}
+            URL: ${{needs.dev-deploy.outputs.application-uri}}
           run: |
             echo $URL
             echo "----------"
@@ -255,86 +216,15 @@ jobs:
    prod-deploy:
     if: github.ref == 'refs/heads/main'
     needs: docker
-    environment: 
-      name: production
-      url: https://${{steps.set-ingress-host-address.outputs.APP_INGRESS_HOST}}
-    outputs:
-      APP_INGRESS_URL: ${{steps.set-ingress-host-address.outputs.APP_INGRESS_HOST}}
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout Repo
-        uses: actions/checkout@v4
-
-      - name: Install kubectl CLI
-        uses: azure/setup-kubectl@v4
-        with: 
-          version: 'v1.33.1'
-      
-      - name: Authenticate to Google Cloud
-        uses: google-github-actions/auth@v2
-        with:
-          credentials_json: '${{ secrets.GCP_SA_KEY }}'
-
-
-      - name: Set Kubeconfig file
-        uses: azure/k8s-set-context@v4
-        with:
-          method: kubeconfig
-          kubeconfig: ${{secrets.KUBECONFIG}}
-
-      - name: Set up GKE credentials
-        uses: google-github-actions/get-gke-credentials@v2
-        with:
-          cluster_name: kkproject-cluster
-          location: us-central1
-
-      - name: Fetch K8s Cluster Details
-        run: |
-          kubectl version 
-          echo ---------------
-          kubectl get nodes
-      
-      - name: Save Nginx Ingress Controller IP as a GITHUB Environment
-        run: |
-         echo "INGRESS_IP=$(kubectl -n ingress-nginx get services ingress-nginx-controller -o jsonpath="{.status.loadBalancer.ingress[0].ip}")" >> $GITHUB_ENV
-
-      - name: Replace Token
-        uses: cschleiden/replace-tokens@v1
-        with:
-          tokenPrefix: '_{_'
-          tokenSuffix: '_}_'
-          files: '["kubernetes/production/*.yaml"]'
-        env:
-          NAMESPACE: ${{vars.NAMESPACE}}
-          REPLICAS: ${{vars.REPLICAS}}
-          IMAGE: ${{vars.DOCKER_USERNAME}}/solar-system:${{github.sha}}
-          INGRESS_IP: ${{env.INGRESS_IP}}
-
-      - name: Check files
-        run: |
-         cat kubernetes/production/*.yaml
-
-      - name: Create namespace 
-        run: | 
-          kubectl get ns ${{vars.NAMESPACE}} || kubectl create ns ${{vars.NAMESPACE}}
-
-      - name: Create MongoDB Secret
-        run: |
-         kubectl create secret generic mongo-db-creds -n ${{vars.NAMESPACE}} \
-         --from-literal=MONGO_URI=${{env.MONGO_URI}} \
-         --from-literal=MONGO_USERNAME=${{vars.MONGO_USERNAME}} \
-         --from-literal=MONGO_PASSWORD=${{secrets.MONGO_PASSWORD}} \
-         --dry-run=client --save-config \
-         -o yaml | kubectl apply -f -
-      
-      - name: Deploy to Dev Env
-        run: |
-          kubectl apply -f kubernetes/production
-        
-      - name: Set App Ingress Host URL
-        id: set-ingress-host-address
-        run: |
-         echo "APP_INGRESS_HOST=$(kubectl -n ${{vars.NAMESPACE}} get ingress -o jsonpath="{.items[0].spec.tls[0].hosts[0]}")" >> $GITHUB_OUTPUT
+    uses: tobi-willy/solar-system/.github/workflows/reuse-deployment.yaml@feature/exploring-workflow
+    secrets:
+      gcp-auth: ${{secrets.GCP_SA_KEY}}
+      k8s-kubeconfig: ${{secrets.KUBECONFIG}}
+      mongodb-password: ${{ secrets.MONGO_PASSWORD}}
+    with:
+      mongodb-uri: ${{vars.MONGO_URI}}
+      environment: production
+      k8s-manifest-uri: kubernetes/production/
 
    prod-integration-testing:
       name: Prod Integration Testing
@@ -344,9 +234,9 @@ jobs:
       steps:
         - name: Test URL output CURL and JQ
           env: 
-            URL: ${{needs.prod-deploy.outputs.APP_INGRESS_URL}}
+            URL: ${{needs.prod-deploy.outputs.application-uri}}
           run: |
             echo $URL
-            echo "----------"
-            curl https://$URL/live -s -k | jq -r .status | grep -i live
+            echo "--------------------"
+            curl https://$URL/live -s -k | grep -iq live
       
